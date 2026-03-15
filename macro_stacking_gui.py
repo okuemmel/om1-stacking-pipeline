@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-OM-1 Macro Focus Stacking Pipeline v3.2
+OM-1 Macro Focus Stacking Pipeline v3.4
 Automated workflow: SD Card → Series Detection → Focus Stacking → Output
 
-NEW in v3.2:
-- Full GUI mode (no terminal interaction)
-- Matrix layout for many series (responsive grid)
-- Smaller thumbnails, first image preview
-- Progress tracking in GUI
+NEW in v3.4:
+- Thumbnail caching (instant on second run!)
+- ImageMagick fallback for ORFs without embedded previews
+- Progress indicator during thumbnail generation
 """
 
 import os
@@ -21,44 +20,41 @@ from datetime import datetime
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import io
 import threading
+import hashlib
 
 # ═══════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════
 
 CONFIG_FILE = Path.home() / '.stacking_config.yaml'
-DEFAULT_CONFIG = Path(__file__).parent / 'examples' / 'config_default.yaml'
+CACHE_DIR = Path.home() / '.stacking_cache' / 'thumbnails'
 
 def load_config():
     """Load configuration from YAML file"""
     if not CONFIG_FILE.exists():
-        if DEFAULT_CONFIG.exists():
-            shutil.copy(DEFAULT_CONFIG, CONFIG_FILE)
-        else:
-            # Create minimal default config
-            default = {
-                'sd_card_mode': 'ask',
-                'output_dir': '~/Pictures/Stacked',
-                'temp_dir': '/tmp/stacking',
-                'time_threshold': 30,
-                'min_images': 3,
-                'stacker': 'helicon',
-                'helicon_binary': '/Applications/HeliconFocus.app/Contents/MacOS/HeliconFocus',
-                'helicon_method': 'C',
-                'helicon_radius': 8,
-                'helicon_smoothing': 4,
-                'jpg_quality': 95,
-                'jpg_converter': 'imagemagick',
-                'output_format': 'jpg',
-                'output_quality': 95,
-                'keep_temp': False
-            }
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CONFIG_FILE, 'w') as f:
-                yaml.dump(default, f)
+        default = {
+            'sd_card_mode': 'ask',
+            'output_dir': '~/Pictures/Stacked',
+            'temp_dir': '/tmp/stacking',
+            'time_threshold': 30,
+            'min_images': 3,
+            'stacker': 'helicon',
+            'helicon_binary': '/Applications/HeliconFocus.app/Contents/MacOS/HeliconFocus',
+            'helicon_method': 'C',
+            'helicon_radius': 8,
+            'helicon_smoothing': 4,
+            'jpg_quality': 95,
+            'jpg_converter': 'imagemagick',
+            'output_format': 'jpg',
+            'output_quality': 95,
+            'keep_temp': False
+        }
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, 'w') as f:
+            yaml.dump(default, f)
     
     with open(CONFIG_FILE) as f:
         return yaml.safe_load(f)
@@ -172,47 +168,96 @@ def find_image_series(dcim_path, config, progress_callback=None):
     return series
 
 # ═══════════════════════════════════════════════════════════
-# Thumbnail Generation
+# Thumbnail Generation with Caching (NEW!)
 # ═══════════════════════════════════════════════════════════
+
+def get_cache_path(image_path):
+    """Generate cache path for thumbnail"""
+    # Use file path + mtime as cache key
+    stat = image_path.stat()
+    cache_key = f"{image_path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
+    
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{cache_hash}.jpg"
 
 def generate_thumbnail(image_path, size=(150, 100)):
     """
-    Generate thumbnail from RAW or JPG image
-    Uses first image of series
+    Generate thumbnail with caching
+    Priority:
+    1. OOC JPG (instant ⚡⚡⚡)
+    2. Cache (instant ⚡⚡⚡)
+    3. ImageMagick on ORF (slow 🐢, but works!)
     """
     try:
-        # Check for OOC JPG first (much faster!)
+        # 1. Check for OOC JPG first (fastest!)
         jpg_path = image_path.with_suffix('.JPG')
         if not jpg_path.exists():
             jpg_path = image_path.with_suffix('.jpg')
         
         if jpg_path.exists():
+            logger.debug(f"✓ OOC JPG: {jpg_path.name}")
             img = Image.open(jpg_path)
             img.thumbnail(size, Image.Resampling.LANCZOS)
             return img
         
-        # Fallback: Extract thumbnail from RAW
-        result = subprocess.run(
-            ['exiftool', '-b', '-PreviewImage', str(image_path)],
-            capture_output=True,
-            check=True,
-            timeout=10
-        )
+        # 2. Check cache
+        cache_path = get_cache_path(image_path)
+        if cache_path.exists():
+            logger.debug(f"✓ Cache hit: {image_path.name}")
+            img = Image.open(cache_path)
+            return img
+        
+        # 3. Generate with ImageMagick (slow!)
+        logger.debug(f"⚙ Generating thumbnail: {image_path.name}")
+        
+        # Use ImageMagick to extract small preview
+        result = subprocess.run([
+            'magick',
+            str(image_path) + '[0]',  # First frame only
+            '-thumbnail', f'{size[0]}x{size[1]}',
+            '-quality', '85',
+            'jpg:-'
+        ], capture_output=True, check=True, timeout=30)
         
         if result.stdout:
             img = Image.open(io.BytesIO(result.stdout))
-            img.thumbnail(size, Image.Resampling.LANCZOS)
+            
+            # Save to cache
+            img.save(cache_path, 'JPEG', quality=85)
+            logger.debug(f"✓ Cached: {cache_path.name}")
+            
             return img
         
-        return create_placeholder_image(size)
+        # Fallback: Placeholder
+        logger.warning(f"⚠ Placeholder for {image_path.name}")
+        return create_placeholder_image(size, image_path.stem)
     
+    except subprocess.TimeoutExpired:
+        logger.warning(f"⏱ Timeout: {image_path.name}")
+        return create_placeholder_image(size, image_path.stem)
     except Exception as e:
-        logger.debug(f"Thumbnail generation failed for {image_path.name}: {e}")
-        return create_placeholder_image(size)
+        logger.debug(f"❌ Failed {image_path.name}: {e}")
+        return create_placeholder_image(size, image_path.stem)
 
-def create_placeholder_image(size=(150, 100)):
-    """Create a placeholder image"""
+def create_placeholder_image(size=(150, 100), text="RAW"):
+    """Create a placeholder image with text"""
     img = Image.new('RGB', size, color='#555555')
+    draw = ImageDraw.Draw(img)
+    
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 12)
+    except:
+        font = ImageFont.load_default()
+    
+    # Draw text centered
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    
+    position = ((size[0] - text_width) // 2, (size[1] - text_height) // 2)
+    draw.text(position, text, fill='#ffffff', font=font)
+    
     return img
 
 # ═══════════════════════════════════════════════════════════
@@ -230,7 +275,7 @@ class StackingPipelineGUI:
         
         # Create main window
         self.root = tk.Tk()
-        self.root.title("OM-1 Macro Focus Stacking Pipeline v3.2")
+        self.root.title("OM-1 Macro Focus Stacking Pipeline v3.4")
         self.root.geometry("1400x900")
         
         # Configure root grid
@@ -254,7 +299,7 @@ class StackingPipelineGUI:
             text="🔬 OM-1 Stacking Pipeline",
             font=('Arial', 24, 'bold'),
             bg='#ecf0f1',
-            fg='#2c3e50'
+            fg='black'
         ).pack(pady=20)
         
         tk.Label(
@@ -262,7 +307,7 @@ class StackingPipelineGUI:
             text="Select SD Card / Source Folder",
             font=('Arial', 14),
             bg='#ecf0f1',
-            fg='#7f8c8d'
+            fg='black'
         ).pack(pady=10)
         
         # Find SD cards
@@ -273,9 +318,11 @@ class StackingPipelineGUI:
                 btn = tk.Button(
                     center,
                     text=f"📁 {card}",
-                    font=('Arial', 12),
+                    font=('Arial', 12, 'bold'),
                     bg='#3498db',
                     fg='white',
+                    activebackground='#2980b9',
+                    activeforeground='white',
                     padx=30,
                     pady=15,
                     command=lambda c=card: self._select_source(c, frame)
@@ -286,9 +333,11 @@ class StackingPipelineGUI:
         tk.Button(
             center,
             text="📂 Browse for Folder...",
-            font=('Arial', 12),
+            font=('Arial', 12, 'bold'),
             bg='#95a5a6',
             fg='white',
+            activebackground='#7f8c8d',
+            activeforeground='white',
             padx=30,
             pady=15,
             command=lambda: self._browse_folder(frame)
@@ -390,7 +439,7 @@ class StackingPipelineGUI:
             text=f"🔬 Found {len(self.series)} Series - Select which to stack",
             font=('Arial', 16, 'bold'),
             bg='#2c3e50',
-            fg='white',
+            fg='black',
             pady=20
         ).pack()
         
@@ -420,13 +469,48 @@ class StackingPipelineGUI:
         
         # Generate series cards in grid (4 columns)
         self.checkbox_vars = []
-        self.selected_indices = list(range(len(self.series)))  # All selected by default
+        self.selected_indices = list(range(len(self.series)))
         
         cols = 4
-        for i, s in enumerate(self.series):
-            row = i // cols
-            col = i % cols
-            self._create_series_card_compact(scrollable_frame, i, s, row, col)
+        
+        # Show loading message
+        loading_label = tk.Label(
+            scrollable_frame,
+            text="⏳ Generating thumbnails...\n(First time may be slow, then cached!)",
+            font=('Arial', 14),
+            bg='#ecf0f1',
+            fg='#7f8c8d'
+        )
+        loading_label.grid(row=0, column=0, columnspan=cols, pady=50)
+        
+        self.thumb_progress_label = tk.Label(
+            scrollable_frame,
+            text="0 / 0",
+            font=('Arial', 12),
+            bg='#ecf0f1',
+            fg='#95a5a6'
+        )
+        self.thumb_progress_label.grid(row=1, column=0, columnspan=cols)
+        
+        # Generate thumbnails in background
+        def generate_cards():
+            total = len(self.series)
+            for i, s in enumerate(self.series):
+                # Update progress
+                self.root.after(0, lambda i=i, t=total: 
+                    self.thumb_progress_label.config(text=f"{i+1} / {t}"))
+                
+                row = i // cols + 2  # +2 for loading labels
+                col = i % cols
+                self._create_series_card_compact(scrollable_frame, i, s, row, col)
+            
+            # Remove loading labels
+            self.root.after(0, loading_label.destroy)
+            self.root.after(0, self.thumb_progress_label.destroy)
+        
+        thread = threading.Thread(target=generate_cards)
+        thread.daemon = True
+        thread.start()
         
         # Footer with buttons
         footer = tk.Frame(main_frame, bg='#34495e', height=90)
@@ -440,9 +524,11 @@ class StackingPipelineGUI:
             button_frame,
             text="Select All",
             command=self._select_all,
-            font=('Arial', 11),
+            font=('Arial', 11, 'bold'),
             bg='#3498db',
             fg='white',
+            activebackground='#2980b9',
+            activeforeground='white',
             padx=15,
             pady=8
         ).pack(side='left', padx=5)
@@ -451,9 +537,11 @@ class StackingPipelineGUI:
             button_frame,
             text="Select None",
             command=self._select_none,
-            font=('Arial', 11),
+            font=('Arial', 11, 'bold'),
             bg='#95a5a6',
-            fg='white',
+            fg='black',
+            activebackground='#7f8c8d',
+            activeforeground='white',
             padx=15,
             pady=8
         ).pack(side='left', padx=5)
@@ -465,7 +553,9 @@ class StackingPipelineGUI:
             command=self._start_stacking,
             font=('Arial', 13, 'bold'),
             bg='#27ae60',
-            fg='white',
+            fg='black',
+            activebackground='#229954',
+            activeforeground='white',
             padx=25,
             pady=10
         )
@@ -476,9 +566,11 @@ class StackingPipelineGUI:
             button_frame,
             text="Cancel",
             command=self.root.quit,
-            font=('Arial', 11),
+            font=('Arial', 11, 'bold'),
             bg='#e74c3c',
-            fg='white',
+            fg='black',
+            activebackground='#c0392b',
+            activeforeground='white',
             padx=15,
             pady=8
         ).pack(side='left', padx=5)
@@ -500,7 +592,7 @@ class StackingPipelineGUI:
         # Get FIRST image for preview
         img_path = series_data[0][0]
         
-        # Generate thumbnail (smaller: 150x100)
+        # Generate thumbnail (with caching!)
         thumb = generate_thumbnail(img_path, size=(150, 100))
         photo = ImageTk.PhotoImage(thumb)
         
@@ -518,14 +610,16 @@ class StackingPipelineGUI:
             card,
             text=f"Serie {index + 1}",
             font=('Arial', 11, 'bold'),
-            bg='white'
+            bg='white',
+            fg='#2c3e50'
         ).pack(pady=(5, 2))
         
         tk.Label(
             card,
             text=f"📸 {len(series_data)} images",
             font=('Arial', 9),
-            bg='white'
+            bg='white',
+            fg='#34495e'
         ).pack()
         
         tk.Label(
@@ -544,9 +638,12 @@ class StackingPipelineGUI:
             card,
             text="Stack",
             variable=var,
-            font=('Arial', 9),
+            font=('Arial', 9, 'bold'),
             bg='white',
+            fg='#27ae60',
             activebackground='white',
+            activeforeground='#229954',
+            selectcolor='white',
             command=lambda idx=index, v=var: self._on_toggle(idx, v)
         )
         check.pack(pady=3)
@@ -560,7 +657,6 @@ class StackingPipelineGUI:
             if index in self.selected_indices:
                 self.selected_indices.remove(index)
         
-        # Update button text
         self.start_button.config(
             text=f"▶ Start Stacking ({len(self.selected_indices)} selected)"
         )
@@ -589,13 +685,8 @@ class StackingPipelineGUI:
             messagebox.showwarning("No Selection", "Please select at least one series to stack.")
             return
         
-        # Get selected series
         selected_series = [self.series[i] for i in sorted(self.selected_indices)]
-        
-        # Close current window and start processing
         self.root.destroy()
-        
-        # Run processing (this will be in a new window or terminal output)
         self._run_processing(selected_series)
     
     def _run_processing(self, selected_series):
@@ -621,7 +712,6 @@ class StackingPipelineGUI:
             
             process_series(series_data, i, len(selected_series), self.config, stats)
         
-        # Print final statistics
         print_statistics(stats)
         
         messagebox.showinfo(
@@ -636,36 +726,21 @@ class StackingPipelineGUI:
         self.root.mainloop()
 
 # ═══════════════════════════════════════════════════════════
-# Image Preparation & Stacking (same as v3.1)
+# Image Preparation & Stacking (same as before)
 # ═══════════════════════════════════════════════════════════
 
 def convert_raw_to_jpg(raw_file, output_dir, config):
     """Convert ORF to JPG"""
     output_file = output_dir / f"{raw_file.stem}.jpg"
     quality = config.get('jpg_quality', 95)
-    converter = config.get('jpg_converter', 'imagemagick')
     
     try:
-        if converter == 'imagemagick':
-            subprocess.run([
-                'magick',
-                str(raw_file),
-                '-quality', str(quality),
-                str(output_file)
-            ], check=True, capture_output=True)
-        elif converter == 'dcraw':
-            dcraw_process = subprocess.Popen([
-                'dcraw', '-c', '-w', '-q', '3', '-6', str(raw_file)
-            ], stdout=subprocess.PIPE)
-            
-            subprocess.run([
-                'magick', '-', '-quality', str(quality), str(output_file)
-            ], stdin=dcraw_process.stdout, check=True, capture_output=True)
-            
-            dcraw_process.wait()
-        else:
-            logger.error(f"Unknown converter: {converter}")
-            return None
+        subprocess.run([
+            'magick',
+            str(raw_file),
+            '-quality', str(quality),
+            str(output_file)
+        ], check=True, capture_output=True)
         
         return output_file if output_file.exists() else None
     except:
@@ -685,13 +760,11 @@ def prepare_images_for_stacking(series_data, temp_dir, config, stats):
             shutil.copy2(jpg_ooc, dest)
             prepared_images.append(dest)
             stats['ooc_jpgs'] += 1
-            logger.debug(f"✓ Using OOC JPG: {jpg_ooc.name}")
         else:
             jpg_converted = convert_raw_to_jpg(orf_file, temp_dir, config)
             if jpg_converted:
                 prepared_images.append(jpg_converted)
                 stats['conversions'] += 1
-                logger.debug(f"⚙ Converted: {orf_file.name}")
     
     return sorted(prepared_images)
 
@@ -735,7 +808,7 @@ def add_metadata(output_file, series_info, config):
             '-overwrite_original',
             '-charset', 'filename=utf8',
             f'-ImageDescription=Focus stacked from {series_info["num_images"]} images',
-            f'-Software=OM-1 Stacking Pipeline v3.2',
+            f'-Software=OM-1 Stacking Pipeline v3.4',
             f'-DateTimeOriginal={series_info["first_timestamp"]}',
             str(output_file)
         ], capture_output=True, check=True)
@@ -840,7 +913,7 @@ def print_statistics(stats):
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    """Main entry point - full GUI mode"""
+    """Main entry point"""
     app = StackingPipelineGUI()
     app.run()
 

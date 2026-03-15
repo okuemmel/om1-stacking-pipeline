@@ -1,79 +1,91 @@
 # ═══════════════════════════════════════════════════════════
-# OM-1 Makro-Stacking Pipeline - Standard-Konfiguration
+# OM-1 Macro Stacking Pipeline Configuration
 # ═══════════════════════════════════════════════════════════
-#
-# Diese Config wird beim ersten Start automatisch nach
-# ~/.stacking_config.yaml kopiert.
-#
-# Anpassen und dann nutzen!
 
-# ───────────────────────────────────────────────────────────
-# SD-Karten-Erkennung
-# ───────────────────────────────────────────────────────────
-
-# Modus: 'ask' (immer fragen), 'first' (erste nehmen), 'manual' (fester Pfad)
+# ─────────────────────────────────────────────────────────
+# SD Card Settings
+# ─────────────────────────────────────────────────────────
+# Mode: 'ask' (interactive), 'first' (auto-select), 'manual' (fixed path)
 sd_card_mode: ask
 
-# Nur für sd_card_mode='manual': Fester Pfad zum DCIM-Ordner
-watch_dir: /Volumes/untitled/DCIM
+# Only used when sd_card_mode='manual'
+watch_dir: /Volumes/SD-CARD/DCIM
 
-# ───────────────────────────────────────────────────────────
-# Output-Einstellungen
-# ───────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────────────────
+# Output Settings
+# ─────────────────────────────────────────────────────────
 output_dir: ~/Pictures/Stacked
 temp_dir: /tmp/stacking
 
-# ───────────────────────────────────────────────────────────
-# Serien-Erkennung
-# ───────────────────────────────────────────────────────────
+# Output format: 'jpg' or 'tiff'
+output_format: jpg
 
-# Max. Sekunden zwischen Bildern einer Serie
+# JPEG quality (1-100, higher = better quality)
+output_quality: 95
+
+# ─────────────────────────────────────────────────────────
+# Series Detection
+# ─────────────────────────────────────────────────────────
+# Maximum seconds between images to be considered same series
 time_threshold: 30
 
-# Mindestanzahl Bilder pro Serie
+# Minimum number of images required to form a series
 min_images: 3
 
-# ───────────────────────────────────────────────────────────
-# GPS-Tagging (optional)
-# ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# Helicon Focus Settings
+# ─────────────────────────────────────────────────────────
+# Path to Helicon Focus binary
+helicon_binary: /Applications/HeliconFocus.app/Contents/MacOS/HeliconFocus
 
-# Pfad zu GPX-Track-File (leer lassen wenn nicht benötigt)
-gpx_file: ""
+# Stacking method:
+#   A = Weighted Average (fast, soft)
+#   B = Depth Map (medium, good for 3D)
+#   C = Pyramid (slow, best quality) ← RECOMMENDED
+helicon_method: C
 
-# ───────────────────────────────────────────────────────────
-# Stacking-Software
-# ───────────────────────────────────────────────────────────
+# Radius parameter (4-20, default: 8)
+# Higher = more aggressive alignment, may introduce artifacts
+helicon_radius: 8
 
-stacker: focus-stack
-stacker_binary: ~/bin/focus-stack/focus-stack.app/Contents/MacOS/focus-stack
+# Smoothing parameter (0-10, default: 4)
+# Higher = smoother transitions between focus zones
+helicon_smoothing: 4
 
-# ───────────────────────────────────────────────────────────
-# focus-stack Parameter
-# ───────────────────────────────────────────────────────────
+# Save depth map alongside result?
+helicon_save_depthmap: false
 
-consistency: 3      # 2-5, höher = strenger
-denoise: 0.5        # 0-2, Rauschunterdrückung
+# ─────────────────────────────────────────────────────────
+# Image Processing
+# ─────────────────────────────────────────────────────────
+# JPEG quality when converting RAW (1-100)
+jpg_quality: 95
 
-save_steps: false
+# RAW to JPG converter: 'imagemagick' or 'dcraw'
+# imagemagick is faster and recommended
+jpg_converter: imagemagick
 
-# ───────────────────────────────────────────────────────────
-# RAW-Konvertierung
-# ───────────────────────────────────────────────────────────
-
-convert_raw: true
-raw_converter: libraw
-
-# ───────────────────────────────────────────────────────────
-# Debug-Optionen
-# ───────────────────────────────────────────────────────────
-
-debug: false
+# ─────────────────────────────────────────────────────────
+# Performance & Debug
+# ─────────────────────────────────────────────────────────
+# Keep temporary files after processing?
+# (Useful for debugging, but uses disk space)
 keep_temp: false
 
-# ───────────────────────────────────────────────────────────
-# Output-Format
-# ───────────────────────────────────────────────────────────
+# Verbose logging?
+verbose: false
 
-output_format: jpg
-output_quality: 95
+# Debug mode (very verbose)?
+debug: false
+
+# Dry run mode (detect series but don't process)?
+dry_run: false
+
+# ─────────────────────────────────────────────────────────
+# Advanced Options
+# ─────────────────────────────────────────────────────────
+# Optional: GPS track file for geotagging
+gpx_file: ""
+
+# Optional: Custom artist name for EXIF metadata
+artist: "Oliver Kuemmel"

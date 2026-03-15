@@ -1,0 +1,16 @@
+# OM-1 Macro Focus Stacking Pipeline
+# Python Dependencies
+
+# Web Interface
+flask>=2.3.0
+flask-socketio>=5.3.0
+python-socketio>=5.9.0
+
+# Image Processing
+pillow>=10.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: Better WSGI server for production
+# gunicorn>=21.0.0
