@@ -1,16 +1,21 @@
 # OM-1 Macro Focus Stacking Pipeline
-# Python Dependencies
+# Core Dependencies
 
-# Web Interface
-flask>=2.3.0
-flask-socketio>=5.3.0
-python-socketio>=5.9.0
+# Web Framework
+flask>=2.3.0,<4.0.0
+flask-socketio>=5.3.0,<6.0.0
+python-socketio>=5.9.0,<6.0.0
 
 # Image Processing
-pillow>=10.0.0
+pillow>=10.0.0,<11.0.0
 
 # Configuration
-pyyaml>=6.0
+pyyaml>=6.0,<7.0
 
-# Optional: Better WSGI server for production
-# gunicorn>=21.0.0
+# Build Tools (optional, for development)
+py2app>=0.28.0; sys_platform == 'darwin'
+
+# Development Tools (optional)
+pytest>=7.0.0
+black>=23.0.0
+flake8>=6.0.0

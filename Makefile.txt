@@ -1,0 +1,57 @@
+# Makefile for OM-1 Stacking Pipeline
+
+.PHONY: all clean build dmg install run test help
+
+help:
+	@echo "OM-1 Stacking Pipeline - Build Commands"
+	@echo "========================================"
+	@echo ""
+	@echo "Available commands:"
+	@echo "  make install    - Install dependencies"
+	@echo "  make build      - Build macOS app"
+	@echo "  make dmg        - Create DMG installer"
+	@echo "  make all        - Build + DMG"
+	@echo "  make run        - Run app directly"
+	@echo "  make test       - Run tests"
+	@echo "  make clean      - Clean build artifacts"
+	@echo "  make icon       - Generate icon (requires SOURCE=image.png)"
+	@echo ""
+
+install:
+	@echo "📦 Installing dependencies..."
+	pip3 install -r requirements.txt
+	pip3 install py2app
+
+build:
+	@echo "🏗️  Building app..."
+	./build.sh
+
+dmg: build
+	@echo "💿 Creating DMG..."
+	./create_dmg.sh
+
+all: build dmg
+
+run:
+	@echo "🚀 Running app..."
+	python3 macro_stacking_web_v4.1.py
+
+test:
+	@echo "🧪 Running tests..."
+	python3 -m pytest tests/ -v
+
+clean:
+	@echo "🧹 Cleaning..."
+	rm -rf build dist
+	rm -rf **/__pycache__
+	rm -rf **/*.pyc
+	find . -name ".DS_Store" -delete
+
+icon:
+	@if [ -z "$(SOURCE)" ]; then \
+		echo "❌ Error: Please specify SOURCE=image.png"; \
+		exit 1; \
+	fi
+	./icon_generator.sh $(SOURCE)
+
+.DEFAULT_GOAL := help
