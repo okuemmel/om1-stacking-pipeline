@@ -1,0 +1,53 @@
+# SD-Karten-Modus: 'ask' (immer fragen), 'first' (erste nehmen), 'manual' (fester Pfad)
+sd_card_mode: ask
+
+# Nur für sd_card_mode='manual': Fester Pfad zum DCIM-Ordner
+watch_dir: /Volumes/untitled/DCIM
+
+# Wo sollen die fertigen Stacks gespeichert werden?
+output_dir: ~/Pictures/Stacked
+
+# Temporäres Verzeichnis für Konvertierung
+temp_dir: /tmp/stacking
+
+# Max. Sekunden zwischen Bildern einer Serie
+time_threshold: 30
+
+# Mindestanzahl Bilder pro Serie
+min_images: 3
+
+# Optional: Pfad zu GPX-Track-File für GPS-Tagging
+gpx_file: ""
+
+# Stacking-Software: 'focus-stack' oder 'shinestacker'
+stacker: focus-stack
+
+# Pfad zum Stacker-Binary
+stacker_binary: ~/bin/focus-stack/focus-stack.app/Contents/MacOS/focus-stack
+
+# focus-stack: Consistency-Level (2-5, höher = strenger)
+consistency: 3
+
+# focus-stack: Denoise-Level (0-2)
+denoise: 0.5
+
+# Debug: Zwischenschritte speichern?
+save_steps: false
+
+# ORF zu TIFF konvertieren?
+convert_raw: true
+
+# RAW-Konverter: 'libraw' (empfohlen) oder 'dcraw'
+raw_converter: libraw
+
+# Debug-Modus
+debug: false
+
+# Temporäre Dateien behalten?
+keep_temp: false
+
+# Output-Format: 'jpg' oder 'tiff'
+output_format: jpg
+
+# JPG-Qualität (1-100)
+output_quality: 95
