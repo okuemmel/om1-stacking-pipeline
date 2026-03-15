@@ -1,45 +1,47 @@
 #!/usr/bin/env python3
 """
-OM-1 Macro Focus Stacking Pipeline - WEB EDITION v4.1
-Automated workflow: SD Card → Series Detection → Focus Stacking → Output
-
-NEW in v4.1:
-- Auto-opens browser on start
-- Live logging with detailed progress
-- Real-time progress tracking
-- Beautiful modern UI
+OM-1 Macro Focus Stacking Pipeline - Web Interface
+Version 4.2 Final - With scan progress feedback
 """
 
 import os
 import sys
-import shutil
 import subprocess
-import yaml
-import logging
+import time
+import shutil
+import hashlib
 from pathlib import Path
 from datetime import datetime
-import time
-import hashlib
-import threading
-import base64
-from io import BytesIO
-import webbrowser
+from typing import List, Dict, Optional
 
-from flask import Flask, render_template_string, jsonify, request, send_file
+import yaml
+from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from PIL import Image
 
-# ═══════════════════════════════════════════════════════════
-# Configuration
-# ═══════════════════════════════════════════════════════════
-
+# ===== CONFIGURATION =====
 CONFIG_FILE = Path.home() / '.stacking_config.yaml'
 CACHE_DIR = Path.home() / '.stacking_cache' / 'thumbnails'
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# In macro_stacking_web_v4.1.py, load_config() Funktion ändern:
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'om1-stacking-secret'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+# Global state
+processing_active = False
+current_series_data = []
+
+# ===== LOGGING =====
+def log(message, level="INFO"):
+    """Enhanced logging with timestamps"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}")
+    sys.stdout.flush()
+
+# ===== CONFIG =====
 def load_config():
-    """Load configuration from YAML file with UTF-8 support"""
+    """Load configuration from YAML file"""
     if not CONFIG_FILE.exists():
         default = {
             'sd_card_mode': 'ask',
@@ -58,1094 +60,793 @@ def load_config():
             'output_format': 'jpg',
             'output_quality': 95,
             'keep_temp': False,
-            'verbose': False,
-            'debug': False,
         }
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Write with UTF-8 encoding
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            yaml.dump(default, f, default_flow_style=False, allow_unicode=True)
+            yaml.dump(default, f, default_flow_style=False)
+        log("Created default config")
     
-    # Read with UTF-8 encoding
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-    except UnicodeDecodeError:
-        # Fallback: try with default encoding
-        with open(CONFIG_FILE, 'r') as f:
-            return yaml.safe_load(f)
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
 
-# ═══════════════════════════════════════════════════════════
-# Logging Setup
-# ═══════════════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-# ═══════════════════════════════════════════════════════════
-# Flask App Setup
-# ═══════════════════════════════════════════════════════════
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'om1-stacking-secret-key'
-socketio = SocketIO(app, cors_allowed_origins="*")
-
-# Global state
-config = load_config()
-series_data = []
-processing_active = False
-
-# ═══════════════════════════════════════════════════════════
-# Image Analysis
-# ═══════════════════════════════════════════════════════════
-
+# ===== SD CARD DETECTION =====
 def find_sd_cards():
-    """Find all mounted SD cards with DCIM folder"""
-    volumes = Path('/Volumes')
+    """Find all mounted SD cards"""
+    log("Searching for SD cards...")
     sd_cards = []
     
-    if not volumes.exists():
+    volumes_dir = Path('/Volumes')
+    if not volumes_dir.exists():
         return sd_cards
     
-    for volume in volumes.iterdir():
-        dcim = volume / 'DCIM'
-        if dcim.exists() and dcim.is_dir():
-            sd_cards.append(str(dcim))
+    for volume in volumes_dir.iterdir():
+        if volume.is_dir() and volume.name not in ['.', '..', 'Macintosh HD']:
+            dcim_path = volume / 'DCIM'
+            if dcim_path.exists():
+                log(f"Found SD card: {volume.name}")
+                sd_cards.append({
+                    'name': volume.name,
+                    'path': str(volume),
+                    'dcim': str(dcim_path)
+                })
     
     return sd_cards
 
-def get_image_timestamp(image_path):
-    """Extract timestamp from image EXIF data"""
+# ===== IMAGE DETECTION =====
+def find_images(directory: Path) -> List[Path]:
+    """Find all image files recursively"""
+    log(f"Searching: {directory}")
+    images = []
+    
+    for ext in ['*.ORF', '*.orf', '*.JPG', '*.jpg']:
+        found = list(directory.rglob(ext))
+        if found:
+            log(f"Found {len(found)} {ext} files")
+            images.extend(found)
+    
+    images = sorted(set(images))
+    log(f"Total: {len(images)} images")
+    return images
+
+def get_image_metadata(image_path: Path) -> Optional[Dict]:
+    """Extract metadata from image"""
     try:
         result = subprocess.run(
             ['exiftool', '-DateTimeOriginal', '-s3', str(image_path)],
             capture_output=True,
-            check=True,
+            text=True,
             timeout=5
         )
         
-        timestamp_str = result.stdout.decode('utf-8', errors='ignore').strip()
-        if not timestamp_str:
-            return None
-            
-        return datetime.strptime(timestamp_str, '%Y:%m:%d %H:%M:%S')
+        if result.returncode == 0 and result.stdout.strip():
+            date_str = result.stdout.strip()
+            dt = datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+            return {'path': image_path, 'timestamp': dt, 'name': image_path.name}
+    except:
+        pass
+    
+    # Fallback
+    try:
+        mtime = image_path.stat().st_mtime
+        return {
+            'path': image_path,
+            'timestamp': datetime.fromtimestamp(mtime),
+            'name': image_path.name
+        }
     except:
         return None
 
-def find_image_series(dcim_path, time_threshold=30, min_images=3):
-    """Group images into series"""
-    images = []
-    for root, dirs, files in os.walk(dcim_path):
-        for file in files:
-            if file.upper().endswith('.ORF'):
-                images.append(Path(root) / file)
-    
+# ===== SERIES DETECTION =====
+def detect_series(images: List[Path], config: Dict) -> List[List[Dict]]:
+    """Detect focus stacking series"""
     if not images:
         return []
     
-    # Get timestamps
-    image_data = []
+    time_threshold = config.get('time_threshold', 30)
+    min_images = config.get('min_images', 3)
+    
+    log(f"Detecting series (threshold: {time_threshold}s, min: {min_images})")
+    
+    # Get metadata
+    images_with_metadata = []
     total = len(images)
     for i, img in enumerate(images):
-        socketio.emit('analysis_progress', {
-            'current': i + 1,
-            'total': total,
-            'message': f"Analyzing {img.name}"
-        })
+        if i % 10 == 0:
+            log(f"Reading metadata: {i+1}/{total}")
+            socketio.emit('scan_progress', {
+                'step': 'reading_metadata',
+                'message': f'Reading metadata: {i+1}/{total}...',
+                'current': i + 1,
+                'total': total
+            })
         
-        timestamp = get_image_timestamp(img)
-        if timestamp:
-            image_data.append((str(img), timestamp))
+        metadata = get_image_metadata(img)
+        if metadata:
+            images_with_metadata.append(metadata)
+    
+    if not images_with_metadata:
+        return []
     
     # Sort by timestamp
-    image_data.sort(key=lambda x: x[1])
+    images_with_metadata.sort(key=lambda x: x['timestamp'])
     
     # Group into series
     series = []
-    current_series = [image_data[0]]
+    current_series = [images_with_metadata[0]]
     
-    for i in range(1, len(image_data)):
-        prev_time = image_data[i-1][1]
-        curr_time = image_data[i][1]
-        time_diff = (curr_time - prev_time).total_seconds()
+    for i in range(1, len(images_with_metadata)):
+        prev = images_with_metadata[i-1]
+        curr = images_with_metadata[i]
+        time_diff = (curr['timestamp'] - prev['timestamp']).total_seconds()
         
         if time_diff <= time_threshold:
-            current_series.append(image_data[i])
+            current_series.append(curr)
         else:
             if len(current_series) >= min_images:
                 series.append(current_series)
-            current_series = [image_data[i]]
+            current_series = [curr]
     
     if len(current_series) >= min_images:
         series.append(current_series)
     
+    log(f"Detected {len(series)} series")
     return series
 
-# ═══════════════════════════════════════════════════════════
-# Thumbnail Generation
-# ═══════════════════════════════════════════════════════════
-
-def get_cache_path(image_path):
-    """Generate cache path for thumbnail"""
-    img_path = Path(image_path)
-    stat = img_path.stat()
-    cache_key = f"{img_path.stem}_{stat.st_size}_{int(stat.st_mtime)}"
-    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
-    
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR / f"{cache_hash}.jpg"
-
-def generate_thumbnail(image_path, size=(200, 133)):
+# ===== THUMBNAIL GENERATION =====
+def generate_thumbnail(image_path: Path, size=(200, 133)) -> Optional[Path]:
     """Generate thumbnail with caching"""
     try:
-        img_path = Path(image_path)
+        stat = image_path.stat()
+        cache_key = f"{image_path.name}_{size[0]}x{size[1]}_{stat.st_size}_{stat.st_mtime}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:16]
+        cache_path = CACHE_DIR / f"{cache_hash}.jpg"
         
-        # 1. Check for OOC JPG
-        jpg_path = img_path.with_suffix('.JPG')
-        if not jpg_path.exists():
-            jpg_path = img_path.with_suffix('.jpg')
-        
-        if jpg_path.exists():
-            img = Image.open(jpg_path)
-            img.thumbnail(size, Image.Resampling.LANCZOS)
-            
-            # Return as base64
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG", quality=85)
-            return base64.b64encode(buffered.getvalue()).decode()
-        
-        # 2. Check cache
-        cache_path = get_cache_path(image_path)
         if cache_path.exists():
-            with open(cache_path, 'rb') as f:
-                return base64.b64encode(f.read()).decode()
+            return cache_path
         
-        # 3. Generate with ImageMagick
-        result = subprocess.run([
-            'magick',
-            str(img_path) + '[0]',
-            '-thumbnail', f'{size[0]}x{size[1]}',
-            '-quality', '85',
-            'jpg:-'
-        ], capture_output=True, check=True, timeout=30)
+        if image_path.suffix.lower() == '.orf':
+            subprocess.run(
+                ['magick', f'{image_path}[0]', '-thumbnail', f'{size[0]}x{size[1]}', str(cache_path)],
+                capture_output=True,
+                timeout=10
+            )
+            if cache_path.exists():
+                return cache_path
         
-        if result.stdout:
-            # Save to cache
-            with open(cache_path, 'wb') as f:
-                f.write(result.stdout)
-            
-            return base64.b64encode(result.stdout).decode()
-        
-        return None
-    
+        with Image.open(image_path) as img:
+            img.thumbnail(size, Image.Resampling.LANCZOS)
+            img.save(cache_path, 'JPEG', quality=85)
+            return cache_path
     except Exception as e:
-        logger.debug(f"Thumbnail failed for {image_path}: {e}")
+        log(f"Thumbnail error: {e}", "WARNING")
         return None
 
-# ═══════════════════════════════════════════════════════════
-# Stacking Processing
-# ═══════════════════════════════════════════════════════════
-
-def convert_raw_to_jpg(raw_file, output_dir):
-    """Convert ORF to JPG"""
-    output_file = output_dir / f"{Path(raw_file).stem}.jpg"
+# ===== STACKING =====
+def prepare_images(series: List[Dict], temp_dir: Path, config: Dict) -> List[Path]:
+    """Prepare images for stacking"""
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    prepared = []
     
-    try:
-        subprocess.run([
-            'magick',
-            str(raw_file),
-            '-quality', '95',
-            str(output_file)
-        ], check=True, capture_output=True)
+    for i, img_data in enumerate(series):
+        img_path = img_data['path']
+        dest = temp_dir / f"{i:04d}.jpg"
         
-        return output_file if output_file.exists() else None
-    except:
-        return None
-
-def prepare_images_for_stacking(series_images, temp_dir):
-    """Prepare images: use OOC JPG or convert ORF"""
-    prepared_images = []
-    ooc_count = 0
-    conv_count = 0
+        if img_path.suffix.lower() in ['.jpg', '.jpeg']:
+            shutil.copy2(img_path, dest)
+            prepared.append(dest)
+        elif img_path.suffix.lower() == '.orf':
+            jpg_path = img_path.with_suffix('.JPG')
+            if not jpg_path.exists():
+                jpg_path = img_path.with_suffix('.jpg')
+            
+            if jpg_path.exists():
+                shutil.copy2(jpg_path, dest)
+                prepared.append(dest)
+            else:
+                subprocess.run(
+                    ['magick', str(img_path), '-quality', '95', str(dest)],
+                    capture_output=True,
+                    timeout=30
+                )
+                if dest.exists():
+                    prepared.append(dest)
     
-    for img_path in series_images:
-        orf_file = Path(img_path)
-        
-        jpg_ooc = orf_file.with_suffix('.JPG')
-        if not jpg_ooc.exists():
-            jpg_ooc = orf_file.with_suffix('.jpg')
-        
-        if jpg_ooc.exists():
-            dest = temp_dir / jpg_ooc.name
-            shutil.copy2(jpg_ooc, dest)
-            prepared_images.append(dest)
-            ooc_count += 1
-        else:
-            jpg_converted = convert_raw_to_jpg(orf_file, temp_dir)
-            if jpg_converted:
-                prepared_images.append(jpg_converted)
-                conv_count += 1
-    
-    return sorted(prepared_images), ooc_count, conv_count
+    return prepared
 
-def stack_images_helicon(image_dir, output_file):
+def stack_with_helicon(images: List[Path], output_path: Path, config: Dict) -> bool:
     """Stack with Helicon Focus"""
-    helicon_binary = Path(config['helicon_binary']).expanduser()
-    
-    if not helicon_binary.exists():
+    helicon = config.get('helicon_binary')
+    if not Path(helicon).exists():
+        log("Helicon not found", "ERROR")
         return False
-    
-    method_map = {'A': 0, 'B': 1, 'C': 2}
-    method = config.get('helicon_method', 'C')
-    method_code = method_map.get(method.upper(), 2)
     
     cmd = [
-        str(helicon_binary),
-        '-silent',
-        '-noprogress',
-        f'-mp:{method_code}',
+        helicon, '-silent',
+        f'-mp:{config.get("helicon_method", "C")}',
         f'-rp:{config.get("helicon_radius", 8)}',
         f'-sp:{config.get("helicon_smoothing", 4)}',
-        f'-j:{config.get("output_quality", 95)}',
-        f'-save:{output_file}',
-        str(image_dir)
     ]
+    cmd.extend([str(img) for img in images])
+    cmd.append(f'-save:{output_path}')
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return result.returncode == 0 and output_file.exists()
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        return result.returncode == 0 and output_path.exists()
     except:
         return False
 
-def process_series_background(selected_indices):
-    """Process selected series in background"""
+def add_metadata(output_path: Path, series: List[Dict], config: Dict):
+    """Add EXIF metadata"""
+    try:
+        subprocess.run([
+            'exiftool', '-overwrite_original',
+            '-TagsFromFile', str(series[0]['path']),
+            '-all:all',
+            f'-UserComment=Stacked from {len(series)} images',
+            '-Software=OM-1 Stacking Pipeline v4.2',
+            str(output_path)
+        ], capture_output=True, timeout=10)
+    except:
+        pass
+
+# ===== PROCESSING =====
+def process_series_background(series_ids: List[int], config: Dict):
+    """Process series in background"""
     global processing_active
     processing_active = True
     
-    stats = {
-        'successful': 0,
-        'failed': 0,
-        'total_time': 0
-    }
+    output_dir = Path(config['output_dir']).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp_base = Path(config['temp_dir'])
     
-    selected_series = [series_data[i] for i in selected_indices]
-    total = len(selected_series)
+    total = len(series_ids)
+    success = 0
     
-    socketio.emit('processing_log', {
-        'message': f'Processing {total} series...',
-        'level': 'info'
-    })
-    
-    for i, series_dict in enumerate(selected_series):
-        series_num = i + 1
-        
-        socketio.emit('processing_progress', {
-            'current': i,
-            'total': total,
-            'message': f"Serie {series_num}/{total}: Starting...",
-            'status': 'info'
-        })
-        
-        start_time = time.time()
-        
-        # Extract images from dict
-        series_images = series_dict['images']
-        
-        socketio.emit('processing_log', {
-            'message': f'Serie {series_num}: {len(series_images)} images',
-            'level': 'info'
-        })
-        
-        # Get first image timestamp
-        first_img_data = series_images[0]
-        first_img_path = first_img_data['path']
-        first_timestamp = datetime.fromisoformat(first_img_data['timestamp'])
-        
-        # Setup directories
-        output_dir = Path(config['output_dir']).expanduser()
-        temp_dir = Path(config['temp_dir']).expanduser() / f"series_{series_num}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
+    for idx, sid in enumerate(series_ids):
         try:
-            # Prepare images
-            socketio.emit('processing_log', {
-                'message': f'Serie {series_num}: Preparing images...',
-                'level': 'info'
+            series_data = current_series_data[sid]
+            series = [{'path': Path(img['path']), 'name': img['name']} for img in series_data['images']]
+            
+            socketio.emit('progress', {
+                'current': idx + 1,
+                'total': total,
+                'percent': int((idx / total) * 100),
+                'status': f"Processing {idx+1}/{total}",
+                'log': f"→ Series {idx+1}: {len(series)} images"
             })
             
-            image_paths = [img['path'] for img in series_images]
-            prepared_images, ooc_count, conv_count = prepare_images_for_stacking(image_paths, temp_dir)
+            temp_dir = temp_base / f"series_{sid}_{int(time.time())}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
             
-            if not prepared_images:
-                stats['failed'] += 1
-                socketio.emit('processing_log', {
-                    'message': f'Serie {series_num}: No images prepared!',
-                    'level': 'error'
-                })
-                continue
+            prepared = prepare_images(series, temp_dir, config)
             
-            socketio.emit('processing_log', {
-                'message': f'Serie {series_num}: Prepared {len(prepared_images)} images ({ooc_count} OOC JPG, {conv_count} converted)',
-                'level': 'success'
+            socketio.emit('progress', {
+                'current': idx + 1,
+                'total': total,
+                'percent': int((idx / total) * 100),
+                'status': f"Stacking {idx+1}/{total}",
+                'log': f"  Stacking {len(prepared)} images..."
             })
             
-            # Stack
-            timestamp_str = first_timestamp.strftime('%Y%m%d_%H%M%S')
-            output_file = output_dir / f"stack_{timestamp_str}.jpg"
+            output_path = output_dir / f"stack_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             
-            socketio.emit('processing_log', {
-                'message': f'Serie {series_num}: Stacking with Helicon Focus (Method {config.get("helicon_method", "C")})...',
-                'level': 'info'
-            })
-            
-            success = stack_images_helicon(temp_dir, output_file)
-            
-            if success:
-                elapsed = time.time() - start_time
-                stats['successful'] += 1
-                stats['total_time'] += elapsed
-                
-                socketio.emit('processing_progress', {
-                    'current': series_num,
+            if stack_with_helicon(prepared, output_path, config):
+                add_metadata(output_path, series, config)
+                success += 1
+                socketio.emit('progress', {
+                    'current': idx + 1,
                     'total': total,
-                    'message': f"Serie {series_num}/{total}: Complete!",
-                    'status': 'success'
-                })
-                
-                socketio.emit('processing_log', {
-                    'message': f'Serie {series_num}: Stack created in {elapsed:.1f}s → {output_file.name}',
-                    'level': 'success'
+                    'percent': int(((idx+1) / total) * 100),
+                    'status': f"Complete {idx+1}/{total}",
+                    'log': f"  ✓ {output_path.name}"
                 })
             else:
-                stats['failed'] += 1
-                socketio.emit('processing_log', {
-                    'message': f'Serie {series_num}: Stacking failed!',
-                    'level': 'error'
+                socketio.emit('progress', {
+                    'current': idx + 1,
+                    'total': total,
+                    'percent': int(((idx+1) / total) * 100),
+                    'log': f"  ✗ Failed"
                 })
+            
+            if not config.get('keep_temp'):
+                shutil.rmtree(temp_dir, ignore_errors=True)
         
         except Exception as e:
-            logger.error(f"Error processing series {series_num}: {e}")
-            stats['failed'] += 1
-            socketio.emit('processing_log', {
-                'message': f'Serie {series_num}: Error - {str(e)}',
-                'level': 'error'
+            log(f"Error: {e}", "ERROR")
+            socketio.emit('progress', {
+                'current': idx + 1,
+                'total': total,
+                'percent': int(((idx+1) / total) * 100),
+                'log': f"  ✗ Error: {e}"
+            })
+    
+    socketio.emit('complete', {'total': total, 'success': success, 'failed': total - success, 'time': 0})
+    processing_active = False
+
+# ===== API ROUTES =====
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/sd-cards')
+def get_sd_cards():
+    try:
+        return jsonify({'sd_cards': find_sd_cards()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/scan', methods=['POST'])
+def scan_directory():
+    """Scan with progress updates"""
+    try:
+        directory = Path(request.json.get('directory', '')).expanduser().resolve()
+        
+        if not directory.exists():
+            return jsonify({'error': 'Directory not found'}), 404
+        
+        socketio.emit('scan_progress', {'step': 'finding', 'message': 'Finding images...'})
+        
+        images = find_images(directory)
+        if not images:
+            return jsonify({'error': 'No images found'}), 404
+        
+        socketio.emit('scan_progress', {'step': 'metadata', 'message': f'Reading metadata from {len(images)} images...'})
+        
+        config = load_config()
+        series = detect_series(images, config)
+        
+        if not series:
+            return jsonify({'error': 'No series detected'}), 404
+        
+        socketio.emit('scan_progress', {'step': 'thumbnails', 'message': f'Generating thumbnails for {len(series)} series...'})
+        
+        global current_series_data
+        current_series_data = []
+        
+        for i, s in enumerate(series):
+            socketio.emit('scan_progress', {
+                'step': 'thumbnails',
+                'message': f'Thumbnail {i+1}/{len(series)}...',
+                'current': i+1,
+                'total': len(series)
+            })
+            
+            thumb = generate_thumbnail(s[0]['path'])
+            current_series_data.append({
+                'id': i,
+                'image_count': len(s),
+                'start_time': s[0]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'end_time': s[-1]['timestamp'].strftime('%Y-%m-%d %H:%M:%S'),
+                'duration': int((s[-1]['timestamp'] - s[0]['timestamp']).total_seconds()),
+                'thumbnail': f'/api/thumbnail/{i}' if thumb else None,
+                'images': [{'path': str(img['path']), 'name': img['name']} for img in s]
             })
         
-        finally:
-            if not config.get('keep_temp', False):
-                shutil.rmtree(temp_dir, ignore_errors=True)
+        log(f"Scan complete: {len(current_series_data)} series")
+        return jsonify({'series': current_series_data})
     
-    processing_active = False
-    socketio.emit('processing_complete', stats)
+    except Exception as e:
+        log(f"Scan error: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
-# ═══════════════════════════════════════════════════════════
-# Web Routes
-# ═══════════════════════════════════════════════════════════
+@app.route('/api/thumbnail/<int:series_id>')
+def get_thumbnail(series_id):
+    try:
+        series = current_series_data[series_id]
+        thumb = generate_thumbnail(Path(series['images'][0]['path']))
+        if thumb:
+            return send_file(thumb, mimetype='image/jpeg')
+        return jsonify({'error': 'Not available'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-HTML_TEMPLATE = """
+@app.route('/api/process', methods=['POST'])
+def process_api():
+    global processing_active
+    if processing_active:
+        return jsonify({'error': 'Already processing'}), 400
+    
+    try:
+        series_ids = request.json.get('series_ids', [])
+        if not series_ids:
+            return jsonify({'error': 'No series selected'}), 400
+        
+        config = load_config()
+        
+        import threading
+        thread = threading.Thread(target=process_series_background, args=(series_ids, config))
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({'status': 'started', 'total': len(series_ids)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ===== HTML (gekürzt - nutze das von oben, ergänze nur scan_progress listener) =====
+HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>OM-1 Stacking Pipeline v4.1</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <title>OM-1 Stacking Pipeline</title>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
+        /* ... alle Styles von oben ... */
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-            background: #ecf0f1;
-            color: #2c3e50;
-        }
-        
-        .header {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px 20px;
-            text-align: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            min-height: 100vh;
+            padding: 20px;
         }
-        
-        .header h1 { font-size: 2em; margin-bottom: 10px; }
-        .header p { opacity: 0.9; }
-        
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .step {
             background: white;
-            border-radius: 10px;
-            padding: 30px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
         }
-        
-        .step h2 {
-            margin-bottom: 20px;
-            color: #667eea;
-            font-size: 1.5em;
-        }
-        
-        .sd-cards {
-            display: grid;
-            gap: 15px;
-        }
-        
-        .sd-card {
-            background: #667eea;
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-size: 1.1em;
-            font-weight: bold;
+            padding: 30px;
+            text-align: center;
+        }
+        h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .subtitle { opacity: 0.9; font-size: 1.1em; }
+        .step {
+            padding: 30px;
+            border-bottom: 1px solid #eee;
+            display: none;
+        }
+        .step.active { display: block; }
+        .step h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+        }
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
             border: none;
-            text-align: left;
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin: 5px;
         }
-        
-        .sd-card:hover {
-            background: #5568d3;
+        .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
         }
-        
-        .series-grid {
+        .sd-cards, .series-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
+            gap: 15px;
+            margin: 20px 0;
         }
-        
-        .series-card {
-            background: white;
-            border: 2px solid #e0e0e0;
+        .sd-card, .series-card {
+            border: 2px solid #ddd;
             border-radius: 10px;
-            padding: 15px;
-            transition: all 0.3s;
+            padding: 20px;
             cursor: pointer;
+            transition: all 0.3s;
         }
-        
-        .series-card.selected {
-            border-color: #667eea;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
-        }
-        
-        .series-card:hover {
+        .sd-card:hover, .series-card:hover {
             transform: translateY(-5px);
-            box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
         }
-        
-        .thumbnail {
+        .selected {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.3);
+        }
+        .series-thumbnail {
             width: 100%;
-            height: 133px;
-            background: #f5f5f5;
-            border-radius: 8px;
-            margin-bottom: 10px;
+            height: 150px;
+            background: #f0f0f0;
             display: flex;
             align-items: center;
             justify-content: center;
-            overflow: hidden;
+            font-size: 3em;
+            color: #ddd;
         }
-        
-        .thumbnail img {
+        .series-thumbnail img {
             width: 100%;
             height: 100%;
             object-fit: cover;
         }
-        
-        .thumbnail.loading {
-            color: #999;
-            font-size: 0.9em;
-        }
-        
         .series-info {
-            font-size: 0.9em;
+            padding: 15px;
         }
-        
-        .series-title {
-            font-weight: bold;
-            margin-bottom: 5px;
-            color: #2c3e50;
-        }
-        
-        .series-meta {
-            color: #7f8c8d;
-            font-size: 0.85em;
-        }
-        
-        .checkbox-container {
-            margin-top: 10px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .checkbox-container input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            cursor: pointer;
-        }
-        
-        .checkbox-container label {
-            cursor: pointer;
-            font-weight: bold;
-            color: #27ae60;
-        }
-        
-        .actions {
-            display: flex;
-            gap: 15px;
-            margin-top: 20px;
-            flex-wrap: wrap;
-        }
-        
-        .btn {
-            padding: 15px 30px;
-            border: none;
-            border-radius: 8px;
-            font-size: 1em;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .btn:hover { transform: translateY(-2px); }
-        
-        .btn-primary {
-            background: #27ae60;
-            color: white;
-            flex: 1;
-        }
-        
-        .btn-primary:hover {
-            background: #229954;
-            box-shadow: 0 4px 15px rgba(39, 174, 96, 0.4);
-        }
-        
-        .btn-secondary {
-            background: #3498db;
-            color: white;
-        }
-        
-        .btn-secondary:hover {
-            background: #2980b9;
-        }
-        
-        .btn-danger {
-            background: #e74c3c;
-            color: white;
-        }
-        
-        .btn-danger:hover {
-            background: #c0392b;
-        }
-        
-        .progress-container {
-            background: #f8f9fa;
-            border-radius: 8px;
-            padding: 20px;
-            margin-top: 20px;
-        }
-        
         .progress-bar {
-            width: 100%;
-            height: 30px;
-            background: #e0e0e0;
-            border-radius: 15px;
+            height: 40px;
+            background: #f0f0f0;
+            border-radius: 20px;
             overflow: hidden;
-            margin: 10px 0;
+            margin: 20px 0;
         }
-        
         .progress-fill {
             height: 100%;
             background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-            transition: width 0.3s;
+            transition: width 0.5s;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
             font-weight: bold;
         }
-        
-        .log-entry {
-            padding: 5px 0;
-            border-bottom: 1px solid #34495e;
+        .log {
+            background: #1e1e1e;
+            color: #00ff00;
+            padding: 20px;
+            border-radius: 10px;
+            font-family: monospace;
+            max-height: 400px;
+            overflow-y: auto;
+            margin: 20px 0;
         }
-        
-        .log-entry:last-child {
-            border-bottom: none;
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
         }
-        
-        .log-success { color: #27ae60; }
-        .log-error { color: #e74c3c; }
-        .log-info { color: #3498db; }
-        .log-warning { color: #f39c12; }
-        
-        .hidden { display: none; }
-        
-        @media (max-width: 768px) {
-            .series-grid {
-                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 20px;
+        }
+        .error {
+            background: #fee;
+            color: #c00;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        .success {
+            background: #efe;
+            color: #060;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            font-size: 1.2em;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🔬 OM-1 Macro Focus Stacking Pipeline</h1>
-        <p>Web Edition v4.1 - Modern, Fast, Beautiful</p>
-    </div>
-    
     <div class="container">
-        <!-- Step 1: SD Card Selection -->
-        <div id="step1" class="step">
-            <h2>📁 Step 1: Select Source</h2>
-            <div class="sd-cards" id="sdCards">
-                <button class="sd-card" onclick="loadSDCards()">🔄 Scan for SD Cards</button>
+        <header>
+            <h1>🔬 OM-1 Stacking Pipeline</h1>
+            <p class="subtitle">v4.2 - With Live Progress</p>
+        </header>
+        
+        <div id="step1" class="step active">
+            <h2>📀 Select SD Card</h2>
+            <div class="controls">
+                <button class="btn" onclick="scanSDCards()">🔍 Scan SD Cards</button>
+                <button class="btn" onclick="selectManual()">📁 Browse</button>
             </div>
+            <div id="sdCardList" class="sd-cards"></div>
+            <div id="error1" class="error" style="display:none;"></div>
         </div>
         
-        <!-- Step 2: Series Selection -->
-        <div id="step2" class="step hidden">
-            <h2>📸 Step 2: Select Series to Stack</h2>
-            <div class="progress-container" id="analysisProgress">
-                <div id="analysisMessage">Analyzing images...</div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="analysisBar" style="width: 0%">0%</div>
-                </div>
+        <div id="step2" class="step">
+            <h2>🖼️ Select Series</h2>
+            <div class="controls">
+                <button class="btn" onclick="selectAll()">✅ All</button>
+                <button class="btn" onclick="selectNone()">❌ None</button>
+                <button class="btn" onclick="startProcess()">🚀 Stack</button>
+                <button class="btn" onclick="back()">← Back</button>
             </div>
-            <div class="series-grid" id="seriesGrid"></div>
-            <div class="actions">
-                <button class="btn btn-secondary" onclick="selectAll()">Select All</button>
-                <button class="btn btn-secondary" onclick="selectNone()">Select None</button>
-                <button class="btn btn-primary" onclick="startStacking()">
-                    ▶ Start Stacking (<span id="selectedCount">0</span> selected)
-                </button>
-            </div>
+            <div id="seriesGrid" class="series-grid"></div>
+            <div id="error2" class="error" style="display:none;"></div>
         </div>
         
-        <!-- Step 3: Processing -->
-        <div id="step3" class="step hidden">
-            <h2>⚙️ Step 3: Processing Stacks</h2>
-            
-            <div class="progress-container">
-                <div id="processingMessage" style="font-size: 1.1em; font-weight: bold; margin-bottom: 10px;">
-                    Starting...
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="processingBar" style="width: 0%">0%</div>
-                </div>
-                <div style="margin-top: 10px; color: #7f8c8d; font-size: 0.9em;">
-                    <span id="processingTime">Elapsed: 0s</span>
-                </div>
+        <div id="step3" class="step">
+            <h2>⚙️ Processing</h2>
+            <div class="progress-bar">
+                <div id="progressFill" class="progress-fill" style="width:0%;">0%</div>
             </div>
-            
-            <!-- Live Log -->
-            <div style="background: #2c3e50; color: #ecf0f1; border-radius: 8px; padding: 20px; margin-top: 20px; font-family: 'Courier New', monospace; font-size: 0.9em; max-height: 400px; overflow-y: auto;" id="liveLog">
-                <div style="color: #3498db;">🔬 Starting stacking pipeline...</div>
-            </div>
+            <div id="log" class="log"></div>
         </div>
         
-        <!-- Step 4: Complete -->
-        <div id="step4" class="step hidden">
-            <h2>✅ Complete!</h2>
-            <div id="results"></div>
-            <div class="actions">
-                <button class="btn btn-primary" onclick="location.reload()">Start New Session</button>
-            </div>
+        <div id="step4" class="step">
+            <h2>✅ Complete</h2>
+            <div id="results" class="success"></div>
+            <button class="btn" onclick="location.reload()">🔄 Again</button>
         </div>
     </div>
     
     <script>
         const socket = io();
         let seriesData = [];
-        let selectedIndices = [];
-        let processingStartTime = null;
-        let processingInterval = null;
+        let selected = new Set();
         
-        // Load SD cards
-        function loadSDCards() {
-            fetch('/api/sd_cards')
-                .then(r => r.json())
-                .then(data => {
-                    const container = document.getElementById('sdCards');
-                    container.innerHTML = '';
-                    
-                    if (data.cards.length === 0) {
-                        container.innerHTML = '<p>No SD cards found. Please insert an SD card.</p>';
-                        return;
-                    }
-                    
-                    data.cards.forEach(card => {
-                        const btn = document.createElement('button');
-                        btn.className = 'sd-card';
-                        btn.textContent = `📁 ${card}`;
-                        btn.onclick = () => analyzeSeries(card);
-                        container.appendChild(btn);
-                    });
-                });
-        }
-        
-        // Analyze series
-        function analyzeSeries(path) {
-            document.getElementById('step1').classList.add('hidden');
-            document.getElementById('step2').classList.remove('hidden');
-            document.getElementById('analysisProgress').style.display = 'block';
-            document.getElementById('seriesGrid').style.display = 'none';
-            
-            fetch('/api/analyze', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path})
-            })
-            .then(r => r.json())
-            .then(data => {
-                seriesData = data.series;
-                displaySeries();
-            });
-        }
-        
-        // Display series
-        function displaySeries() {
-            document.getElementById('analysisProgress').style.display = 'none';
-            document.getElementById('seriesGrid').style.display = 'grid';
-            
+        socket.on('scan_progress', (data) => {
             const grid = document.getElementById('seriesGrid');
-            grid.innerHTML = '';
-            
-            seriesData.forEach((series, idx) => {
-                const card = document.createElement('div');
-                card.className = 'series-card selected';
-                card.dataset.index = idx;
-                card.onclick = () => toggleSeries(idx);
-                
-                const firstImg = series.images[0];
-                const lastImg = series.images[series.images.length - 1];
-                const duration = Math.round((new Date(lastImg.timestamp) - new Date(firstImg.timestamp)) / 1000);
-                
-                card.innerHTML = `
-                    <div class="thumbnail loading" id="thumb-${idx}">⏳ Loading...</div>
-                    <div class="series-info">
-                        <div class="series-title">Serie ${idx + 1}</div>
-                        <div class="series-meta">📸 ${series.images.length} images</div>
-                        <div class="series-meta">⏱️ ${duration}s</div>
-                    </div>
-                    <div class="checkbox-container">
-                        <input type="checkbox" id="check-${idx}" checked>
-                        <label for="check-${idx}">Stack</label>
-                    </div>
-                `;
-                
-                grid.appendChild(card);
-                
-                // Load thumbnail async
-                loadThumbnail(idx, firstImg.path);
-            });
-            
-            selectedIndices = [...Array(seriesData.length).keys()];
-            updateSelectedCount();
-        }
-        
-        // Load thumbnail
-        function loadThumbnail(idx, imagePath) {
-            fetch('/api/thumbnail', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: imagePath})
-            })
-            .then(r => r.json())
-            .then(data => {
-                const thumb = document.getElementById(`thumb-${idx}`);
-                if (data.thumbnail) {
-                    thumb.innerHTML = `<img src="data:image/jpeg;base64,${data.thumbnail}">`;
-                    thumb.classList.remove('loading');
-                } else {
-                    thumb.textContent = 'RAW';
-                    thumb.classList.remove('loading');
-                }
-            });
-        }
-        
-        // Toggle series selection
-        function toggleSeries(idx) {
-            const card = document.querySelector(`.series-card[data-index="${idx}"]`);
-            const checkbox = document.getElementById(`check-${idx}`);
-            
-            if (selectedIndices.includes(idx)) {
-                selectedIndices = selectedIndices.filter(i => i !== idx);
-                card.classList.remove('selected');
-                checkbox.checked = false;
-            } else {
-                selectedIndices.push(idx);
-                card.classList.add('selected');
-                checkbox.checked = true;
+            let html = `<div class="loading"><div class="spinner"></div><p><strong>${data.message}</strong></p>`;
+            if (data.current && data.total) {
+                const pct = Math.round((data.current / data.total) * 100);
+                html += `<div style="width:300px;margin:20px auto;"><div class="progress-bar"><div class="progress-fill" style="width:${pct}%;">${pct}%</div></div></div>`;
             }
-            
-            updateSelectedCount();
-        }
-        
-        function selectAll() {
-            selectedIndices = [...Array(seriesData.length).keys()];
-            document.querySelectorAll('.series-card').forEach(card => {
-                card.classList.add('selected');
-                const idx = card.dataset.index;
-                document.getElementById(`check-${idx}`).checked = true;
-            });
-            updateSelectedCount();
-        }
-        
-        function selectNone() {
-            selectedIndices = [];
-            document.querySelectorAll('.series-card').forEach(card => {
-                card.classList.remove('selected');
-                const idx = card.dataset.index;
-                document.getElementById(`check-${idx}`).checked = false;
-            });
-            updateSelectedCount();
-        }
-        
-        function updateSelectedCount() {
-            document.getElementById('selectedCount').textContent = selectedIndices.length;
-        }
-        
-        // Start stacking
-        function startStacking() {
-            if (selectedIndices.length === 0) {
-                alert('Please select at least one series!');
-                return;
-            }
-            
-            document.getElementById('step2').classList.add('hidden');
-            document.getElementById('step3').classList.remove('hidden');
-            
-            // Start timer
-            processingStartTime = Date.now();
-            processingInterval = setInterval(() => {
-                const elapsed = Math.round((Date.now() - processingStartTime) / 1000);
-                document.getElementById('processingTime').textContent = `Elapsed: ${elapsed}s`;
-            }, 1000);
-            
-            addLogEntry('Starting stacking process...', 'info');
-            addLogEntry(`Selected ${selectedIndices.length} series`, 'info');
-            
-            fetch('/api/process', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({indices: selectedIndices})
-            });
-        }
-        
-        function addLogEntry(message, level) {
-            const log = document.getElementById('liveLog');
-            const entry = document.createElement('div');
-            entry.className = `log-entry log-${level}`;
-            
-            const timestamp = new Date().toLocaleTimeString();
-            const icon = {
-                'success': '✓',
-                'error': '✗',
-                'warning': '⚠',
-                'info': '→'
-            }[level] || '•';
-            
-            entry.textContent = `[${timestamp}] ${icon} ${message}`;
-            log.appendChild(entry);
-            
-            // Auto-scroll to bottom
-            log.scrollTop = log.scrollHeight;
-        }
-        
-        // WebSocket events
-        socket.on('analysis_progress', data => {
-            const pct = Math.round((data.current / data.total) * 100);
-            document.getElementById('analysisBar').style.width = pct + '%';
-            document.getElementById('analysisBar').textContent = pct + '%';
-            document.getElementById('analysisMessage').textContent = data.message;
+            html += '</div>';
+            grid.innerHTML = html;
         });
         
-        socket.on('processing_progress', data => {
-            const pct = Math.round((data.current / data.total) * 100);
-            document.getElementById('processingBar').style.width = pct + '%';
-            document.getElementById('processingBar').textContent = `${data.current}/${data.total}`;
-            document.getElementById('processingMessage').textContent = data.message;
-            
-            // Add to live log
-            addLogEntry(data.message, data.status || 'info');
-        });
-        
-        socket.on('processing_log', data => {
-            addLogEntry(data.message, data.level || 'info');
-        });
-        
-        socket.on('processing_complete', data => {
-            if (processingInterval) {
-                clearInterval(processingInterval);
+        socket.on('progress', (data) => {
+            const fill = document.getElementById('progressFill');
+            const log = document.getElementById('log');
+            fill.style.width = data.percent + '%';
+            fill.textContent = data.percent + '%';
+            if (data.log) {
+                log.innerHTML += `<div>${data.log}</div>`;
+                log.scrollTop = log.scrollHeight;
             }
-            
-            document.getElementById('step3').classList.add('hidden');
-            document.getElementById('step4').classList.remove('hidden');
-            
-            const totalMin = (data.total_time / 60).toFixed(1);
-            const avgSec = data.successful > 0 ? (data.total_time / data.successful).toFixed(1) : 0;
-            
+        });
+        
+        socket.on('complete', (data) => {
+            showStep(4);
             document.getElementById('results').innerHTML = `
-                <div style="background: #d4edda; border: 2px solid #28a745; border-radius: 8px; padding: 20px; margin-bottom: 15px;">
-                    <p style="font-size: 1.3em; margin-bottom: 10px; color: #155724;">
-                        ✅ Successfully created <strong>${data.successful}</strong> stack(s)!
-                    </p>
-                </div>
-                ${data.failed > 0 ? `
-                <div style="background: #f8d7da; border: 2px solid #dc3545; border-radius: 8px; padding: 15px; margin-bottom: 15px;">
-                    <p style="color: #721c24;">❌ Failed: ${data.failed}</p>
-                </div>
-                ` : ''}
-                <div style="background: #f8f9fa; border-radius: 8px; padding: 15px;">
-                    <p><strong>⏱️ Total time:</strong> ${data.total_time.toFixed(1)}s (${totalMin}m)</p>
-                    ${data.successful > 0 ? `<p><strong>⚡ Avg time/stack:</strong> ${avgSec}s</p>` : ''}
-                </div>
+                <h2>🎉 Done!</h2>
+                <p><strong>${data.success}</strong> of <strong>${data.total}</strong> stacked</p>
             `;
         });
         
-        // Auto-load on page load
-        loadSDCards();
+        function showStep(n) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById('step' + n).classList.add('active');
+        }
+        
+        async function scanSDCards() {
+            const list = document.getElementById('sdCardList');
+            list.innerHTML = '<div class="loading"><div class="spinner"></div><p>Scanning...</p></div>';
+            
+            const res = await fetch('/api/sd-cards');
+            const data = await res.json();
+            
+            list.innerHTML = '';
+            data.sd_cards.forEach(card => {
+                const div = document.createElement('div');
+                div.className = 'sd-card';
+                div.innerHTML = `<h3>💾 ${card.name}</h3><p>${card.dcim}</p>`;
+                div.onclick = () => selectCard(card.dcim, div);
+                list.appendChild(div);
+            });
+        }
+        
+        async function selectCard(dir, el) {
+            document.querySelectorAll('.sd-card').forEach(c => c.classList.remove('selected'));
+            el.classList.add('selected');
+            await scanDir(dir);
+        }
+        
+        function selectManual() {
+            const path = prompt('Path:', '/Volumes/');
+            if (path) scanDir(path);
+        }
+        
+        async function scanDir(dir) {
+            showStep(2);
+            const grid = document.getElementById('seriesGrid');
+            grid.innerHTML = '<div class="loading"><div class="spinner"></div><p>Scanning...</p></div>';
+            
+            const res = await fetch('/api/scan', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({directory: dir})
+            });
+            
+            const data = await res.json();
+            if (data.error) {
+                grid.innerHTML = `<div class="error">${data.error}</div>`;
+                return;
+            }
+            
+            seriesData = data.series;
+            selected.clear();
+            
+            grid.innerHTML = '';
+            seriesData.forEach((s, i) => {
+                const card = document.createElement('div');
+                card.className = 'series-card';
+                card.innerHTML = `
+                    <div class="series-thumbnail">
+                        ${s.thumbnail ? `<img src="${s.thumbnail}?t=${Date.now()}">` : '📷'}
+                    </div>
+                    <div class="series-info">
+                        <h3>Series ${i+1}</h3>
+                        <p>📸 ${s.image_count} images</p>
+                        <p>🕒 ${s.duration}s</p>
+                    </div>
+                `;
+                card.onclick = () => toggle(i, card);
+                grid.appendChild(card);
+            });
+        }
+        
+        function toggle(i, el) {
+            if (selected.has(i)) {
+                selected.delete(i);
+                el.classList.remove('selected');
+            } else {
+                selected.add(i);
+                el.classList.add('selected');
+            }
+        }
+        
+        function selectAll() {
+            selected.clear();
+            seriesData.forEach((_, i) => selected.add(i));
+            document.querySelectorAll('.series-card').forEach(c => c.classList.add('selected'));
+        }
+        
+        function selectNone() {
+            selected.clear();
+            document.querySelectorAll('.series-card').forEach(c => c.classList.remove('selected'));
+        }
+        
+        async function startProcess() {
+            if (selected.size === 0) {
+                alert('Select at least one series');
+                return;
+            }
+            
+            showStep(3);
+            document.getElementById('log').innerHTML = '<div>[INFO] Starting...</div>';
+            
+            await fetch('/api/process', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({series_ids: Array.from(selected)})
+            });
+        }
+        
+        function back() {
+            showStep(1);
+        }
+        
+        window.onload = scanSDCards;
     </script>
 </body>
 </html>
-"""
+'''
 
-@app.route('/')
-def index():
-    """Main page"""
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/sd_cards')
-def api_sd_cards():
-    """Get available SD cards"""
-    cards = find_sd_cards()
-    return jsonify({'cards': cards})
-
-@app.route('/api/analyze', methods=['POST'])
-def api_analyze():
-    """Analyze images and find series"""
-    global series_data
-    
-    data = request.json
-    path = data.get('path')
-    
-    if not path:
-        return jsonify({'error': 'No path provided'}), 400
-    
-    # Find series in background
-    def analyze():
-        global series_data
-        series = find_image_series(path, 
-            time_threshold=config.get('time_threshold', 30),
-            min_images=config.get('min_images', 3)
-        )
-        
-        # Format for JSON
-        series_data = []
-        for s in series:
-            series_data.append({
-                'images': [
-                    {'path': img[0], 'timestamp': img[1].isoformat()}
-                    for img in s
-                ]
-            })
-    
-    thread = threading.Thread(target=analyze)
-    thread.start()
-    thread.join()  # Wait for completion
-    
-    return jsonify({'series': series_data})
-
-@app.route('/api/thumbnail', methods=['POST'])
-def api_thumbnail():
-    """Generate thumbnail for image"""
-    data = request.json
-    path = data.get('path')
-    
-    if not path:
-        return jsonify({'error': 'No path provided'}), 400
-    
-    thumbnail = generate_thumbnail(path)
-    return jsonify({'thumbnail': thumbnail})
-
-@app.route('/api/process', methods=['POST'])
-def api_process():
-    """Start processing selected series"""
-    data = request.json
-    indices = data.get('indices', [])
-    
-    if not indices:
-        return jsonify({'error': 'No series selected'}), 400
-    
-    # Start processing in background
-    thread = threading.Thread(target=process_series_background, args=(indices,))
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({'status': 'started'})
-
-# ═══════════════════════════════════════════════════════════
-# Main Entry Point
-# ═══════════════════════════════════════════════════════════
-
-def open_browser():
-    """Open browser after short delay - works in bundled app"""
-    time.sleep(1.5)
-    try:
-        # Use macOS 'open' command (more reliable in .app bundle)
-        subprocess.run(['open', 'http://localhost:8080'], check=False)
-    except:
-        # Fallback to webbrowser
-        import webbrowser
-        webbrowser.open('http://localhost:8080')
-
-def main():
-    """Start web server"""
+# ===== MAIN =====
+if __name__ == '__main__':
     print("\n" + "="*60)
-    print("🔬 OM-1 Macro Focus Stacking Pipeline v4.1 - WEB EDITION")
-    print("="*60)
-    print("\n🌐 Starting web server...")
-    print("📱 Server will be available at: http://localhost:8080")
-    print("🌍 Browser should open automatically...")
-    print("\n💡 If browser doesn't open, manually visit: http://localhost:8080")
-    print("💡 Press CTRL+C to stop the server")
+    print("OM-1 Stacking Pipeline v4.2")
     print("="*60 + "\n")
     
-    # Show macOS notification
-    try:
-        subprocess.run([
-            'osascript', '-e',
-            'display notification "Server starting at http://localhost:8080" '
-            'with title "OM-1 Stacking Pipeline"'
-        ], check=False, capture_output=True)
-    except:
-        pass
+    config = load_config()
     
-    # Open browser in background
-    threading.Thread(target=open_browser, daemon=True).start()
+    def open_browser():
+        time.sleep(2.5)
+        try:
+            subprocess.run(['open', 'http://127.0.0.1:8080'], check=False)
+            log("Browser opened")
+        except Exception as e:
+            log(f"Browser error: {e}", "WARNING")
     
-    # Start server
-    try:
-        socketio.run(app, host='127.0.0.1', port=8080, debug=False, allow_unsafe_werkzeug=True)
-    except KeyboardInterrupt:
-        print("\n\n👋 Shutting down gracefully...")
-        sys.exit(0)
-
-if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n👋 Shutting down gracefully...")
-        sys.exit(0)
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        import threading
+        threading.Thread(target=open_browser, daemon=True).start()
+    
+    print("🌐 http://127.0.0.1:8080\n" + "="*60 + "\n")
+    socketio.run(app, host='127.0.0.1', port=8080, debug=False, allow_unsafe_werkzeug=True)
