@@ -1,0 +1,19 @@
+# Schnelles Stacking (für Tests oder Previews)
+
+sd_card_mode: first
+time_threshold: 30
+min_images: 3
+
+stacker: focus-stack
+stacker_binary: ~/bin/focus-stack/focus-stack.app/Contents/MacOS/focus-stack
+
+# Schnellere Parameter
+consistency: 2      # Weniger streng
+denoise: 1.0        # Mehr Glättung
+
+convert_raw: true
+raw_converter: libraw
+
+output_dir: ~/Pictures/Stacked
+output_format: jpg
+output_quality: 85  # Niedrigere Qualität für Geschwindigkeit

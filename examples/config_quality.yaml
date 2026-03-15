@@ -1,0 +1,19 @@
+# Maximale Qualität (langsamer, aber beste Ergebnisse)
+
+sd_card_mode: ask
+time_threshold: 30
+min_images: 5       # Mehr Bilder = bessere Qualität
+
+stacker: focus-stack
+stacker_binary: ~/bin/focus-stack/focus-stack.app/Contents/MacOS/focus-stack
+
+# Beste Qualität
+consistency: 5      # Sehr streng
+denoise: 0          # Kein Denoise
+
+convert_raw: true
+raw_converter: libraw
+
+output_dir: ~/Pictures/Stacked
+output_format: tiff # TIFF statt JPG
+
